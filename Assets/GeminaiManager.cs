@@ -8,111 +8,222 @@ using TMPro;
 public class GeminiManager : MonoBehaviour
 {
     [SerializeField] private string apiKey = "여기에_API_KEY";
+
+    [Header("UI")]
     [SerializeField] private TMP_Text responseText;
     [SerializeField] private TMP_Text countText;
     [SerializeField] private Button askButton;
-    [SerializeField] private Camera arCamera;
+    [SerializeField] private Button ttsButton;
 
+    [Header("YOLO")]
+    [SerializeField] private RunYOLO runYOLO;
+
+    [Header("TTS")]
+    [SerializeField] private TTSManager ttsManager;
+
+    [Header("Prompt")]
     [SerializeField]
     private string systemPrompt =
-        "너는 공장 안전 점검 전문가야. 항상 한국어로 두 문장 이내로 답해";
+        "너는 학교 조교야.";
+
     [SerializeField]
     private string userPrompt =
-        "지금 화면에 보이는 것의 안전 위험 요소를 말해줘";
+        "한국어로 상황을 100자 이내로 설명해줘. 앞으로 수업에 어떻게 쓸 물건들인지. 수업은 어떤 수업이 있을지 설명해줘.";
+
     private bool isProcessing = false;
     private int analysisCount = 0;
 
+    private string lastAnswer = "";
+
     private const string API_URL =
         "https://generativelanguage.googleapis.com/v1beta/models/" +
-        "gemini-2.5-flash-lite:generateContent";
+        "gemini-3.5-flash:generateContent";
 
     void Start()
     {
-        askButton.onClick.AddListener(() => StartCoroutine(AskGemini()));
+        if (askButton != null)
+        {
+            askButton.onClick.AddListener(() => StartCoroutine(AskGemini()));
+            AddButtonPressEffect(askButton);
+        }
 
-        // 버튼 누를 때 / 뗄 때 이벤트 등록
-        EventTrigger trigger = askButton.gameObject.AddComponent<EventTrigger>();
+        if (ttsButton != null)
+        {
+            ttsButton.onClick.AddListener(PlayTTS);
+            AddButtonPressEffect(ttsButton);
+        }
+
+        if (ttsManager == null)
+        {
+            ttsManager = GetComponent<TTSManager>();
+        }
+    }
+
+    void AddButtonPressEffect(Button button)
+    {
+        EventTrigger trigger = button.gameObject.GetComponent<EventTrigger>();
+
+        if (trigger == null)
+            trigger = button.gameObject.AddComponent<EventTrigger>();
 
         EventTrigger.Entry pointerDown = new EventTrigger.Entry();
         pointerDown.eventID = EventTriggerType.PointerDown;
-        pointerDown.callback.AddListener((_) => SetButtonAlpha(0.4f)); // 흐리게
+        pointerDown.callback.AddListener((_) => SetButtonAlpha(button, 0.4f));
         trigger.triggers.Add(pointerDown);
 
         EventTrigger.Entry pointerUp = new EventTrigger.Entry();
         pointerUp.eventID = EventTriggerType.PointerUp;
-        pointerUp.callback.AddListener((_) => SetButtonAlpha(1f)); // 원래대로
+        pointerUp.callback.AddListener((_) => SetButtonAlpha(button, 1f));
         trigger.triggers.Add(pointerUp);
+
+        EventTrigger.Entry pointerExit = new EventTrigger.Entry();
+        pointerExit.eventID = EventTriggerType.PointerExit;
+        pointerExit.callback.AddListener((_) => SetButtonAlpha(button, 1f));
+        trigger.triggers.Add(pointerExit);
     }
 
-    void SetButtonAlpha(float alpha)
+    void SetButtonAlpha(Button button, float alpha)
     {
-        CanvasGroup cg = askButton.GetComponent<CanvasGroup>();
-        if (cg == null) cg = askButton.gameObject.AddComponent<CanvasGroup>();
+        if (button == null)
+            return;
+
+        CanvasGroup cg = button.GetComponent<CanvasGroup>();
+
+        if (cg == null)
+            cg = button.gameObject.AddComponent<CanvasGroup>();
+
         cg.alpha = alpha;
     }
 
     IEnumerator AskGemini()
     {
-        if (isProcessing) yield break;
+        if (isProcessing)
+            yield break;
+
         isProcessing = true;
 
-        responseText.text = "분석 중...";
+        if (responseText != null)
+            responseText.text = "분석 중...";
 
-        // ———— 1단계: AR 카메라 프레임 캡처 ————
-        RenderTexture rt = new RenderTexture(320, 240, 24);
-        arCamera.targetTexture = rt;
-        arCamera.Render();
-        RenderTexture.active = rt;
+        analysisCount++;
 
-        Texture2D screenshot = new Texture2D(320, 240);
-        screenshot.ReadPixels(new Rect(0, 0, 320, 240), 0, 0);
-        screenshot.Apply();
+        if (countText != null)
+        {
+            countText.text = "분석횟수: " + analysisCount;
+        }
 
-        arCamera.targetTexture = null;
-        RenderTexture.active = null;
-        Destroy(rt);
+        string label =
+            runYOLO != null && !string.IsNullOrEmpty(runYOLO.lastDetectedLabel)
+            ? runYOLO.lastDetectedLabel
+            : "unknown";
 
-        // ———— 2단계: 이미지를 Base64로 변환 ————
-        byte[] bytes = screenshot.EncodeToPNG();
-        string base64 = System.Convert.ToBase64String(bytes);
-        Destroy(screenshot);
+        string dynamicPrompt =
+            "감지된 물체: " + label + ". " + userPrompt;
 
-        // ------ 3단계: Gemini API 요청 JSON 구성 ------
-        // 이미지(inline_data)와 질문(text)을 함께 전송
         string json = "{" +
-        "\"system_instruction\":{\"parts\":[{\"text\":\"" + systemPrompt + "\"}]}," +
-        "\"contents\":[{\"parts\":[" +
-        "{\"inline_data\":{\"mime_type\":\"image/png\",\"data\":\"" + base64 + "\"}}," +
-        "{\"text\":\"" + userPrompt + "\"}" +
-        "]}]}";
+            "\"system_instruction\":{\"parts\":[{\"text\":\"" + EscapeJsonString(systemPrompt) + "\"}]}," +
+            "\"contents\":[{\"parts\":[" +
+            "{\"text\":\"" + EscapeJsonString(dynamicPrompt) + "\"}" +
+            "]}]" +
+            "}";
 
-        // ———— 4단계: API 호출 ————
         using var req = new UnityWebRequest(API_URL + "?key=" + apiKey, "POST");
+
         req.uploadHandler = new UploadHandlerRaw(
             System.Text.Encoding.UTF8.GetBytes(json));
+
         req.downloadHandler = new DownloadHandlerBuffer();
         req.SetRequestHeader("Content-Type", "application/json");
 
         yield return req.SendWebRequest();
 
-        // ———— 5단계: 응답 처리 ————
         if (req.result == UnityWebRequest.Result.Success)
         {
-            analysisCount++;
-            countText.text = $"Count: {analysisCount}";
-
-            // JSON 응답에서 텍스트 부분만 추출 (간단 파싱)
             GeminiResponse geminiResponse =
                 JsonUtility.FromJson<GeminiResponse>(req.downloadHandler.text);
-            responseText.text = geminiResponse.candidates[0].content.parts[0].text;
+
+            if (geminiResponse != null &&
+                geminiResponse.candidates != null &&
+                geminiResponse.candidates.Length > 0 &&
+                geminiResponse.candidates[0].content != null &&
+                geminiResponse.candidates[0].content.parts != null &&
+                geminiResponse.candidates[0].content.parts.Length > 0)
+            {
+                lastAnswer = geminiResponse.candidates[0].content.parts[0].text;
+
+                if (responseText != null)
+                    responseText.text = lastAnswer;
+            }
+            else
+            {
+                lastAnswer = "응답을 읽을 수 없습니다.";
+
+                if (responseText != null)
+                    responseText.text = lastAnswer;
+            }
         }
         else
         {
-            responseText.text = "오류: " + req.error;
+            lastAnswer = "";
+
+            if (responseText != null)
+            {
+                responseText.text =
+                    "오류: " + req.error + "\n" + req.downloadHandler.text;
+            }
         }
 
         isProcessing = false;
     }
+
+    public void PlayTTS()
+    {
+        if (ttsManager == null)
+        {
+            Debug.LogWarning("TTSManager가 연결되지 않았습니다.");
+
+            if (responseText != null)
+                responseText.text = "TTSManager가 연결되지 않았습니다.";
+
+            return;
+        }
+
+        string textToSpeak = "";
+
+        if (!string.IsNullOrWhiteSpace(lastAnswer))
+        {
+            textToSpeak = lastAnswer;
+        }
+        else if (responseText != null && !string.IsNullOrWhiteSpace(responseText.text))
+        {
+            textToSpeak = responseText.text;
+        }
+
+        if (string.IsNullOrWhiteSpace(textToSpeak) ||
+            textToSpeak == "분석 중...")
+        {
+            if (responseText != null)
+                responseText.text = "먼저 분석하기 버튼을 눌러 답변을 받아주세요.";
+
+            return;
+        }
+
+        ttsManager.Speak(textToSpeak);
+    }
+
+    string EscapeJsonString(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return "";
+
+        return value
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+            .Replace("\n", "\\n")
+            .Replace("\r", "\\r")
+            .Replace("\t", "\\t");
+    }
+
     [System.Serializable]
     public class GeminiResponse
     {
@@ -136,5 +247,4 @@ public class GeminiManager : MonoBehaviour
     {
         public string text;
     }
-
 }

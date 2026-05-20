@@ -5,38 +5,54 @@ using Unity.InferenceEngine;
 using UnityEngine;
 using UnityEngine.UI;
 using System.Threading.Tasks;
-using UnityEngine.Android; // 안드로이드 권한 요청을 위해 필수
+using UnityEngine.Android;
 
 public class RunYOLO : MonoBehaviour
 {
     [Header("Model Settings")]
     public ModelAsset modelAsset;
     public TextAsset classesAsset;
-    private bool isProcessing = false;
 
     [Header("UI Settings")]
     public RawImage displayImage;
     public Texture2D borderTexture;
     public Font font;
 
-    // --- 최적화를 위한 변수들 ---
-    private int frameCount = 0;
-    const BackendType backend = BackendType.GPUCompute;
-    private Transform displayLocation;
-    private Worker worker;
-    private string[] labels;
-    private RenderTexture targetRT;
-    private RenderTexture yoloRT;
-    private Sprite borderSprite;
-
-    private const int imageWidth = 640;
-    private const int imageHeight = 640;
-    private WebCamTexture webCamTexture;
-    private List<GameObject> boxPool = new List<GameObject>();
+    [Header("Layout Settings")]
+    [SerializeField, Range(0.4f, 0.8f)]
+    private float cameraAreaRatio = 0.6f; // 왼쪽 카메라 영역 비율
 
     [Header("Detection Thresholds")]
     [SerializeField, Range(0, 1)] float iouThreshold = 0.5f;
     [SerializeField, Range(0, 1)] float scoreThreshold = 0.5f;
+
+    // GeminiManager에서 가져갈 마지막 감지 라벨
+    public string lastDetectedLabel = "";
+
+    private bool isProcessing = false;
+    private int frameCount = 0;
+
+    private const BackendType backend = BackendType.GPUCompute;
+
+    private Worker worker;
+    private string[] labels;
+
+    private RenderTexture displayRT;
+    private RenderTexture yoloRT;
+
+    private Sprite borderSprite;
+    private Transform displayLocation;
+
+    private WebCamTexture webCamTexture;
+    private List<GameObject> boxPool = new List<GameObject>();
+
+    // YOLO 입력 크기
+    private const int imageWidth = 640;
+    private const int imageHeight = 640;
+
+    // 화면 표시용 와이드 해상도
+    private const int displayWidthRT = 1280;
+    private const int displayHeightRT = 720;
 
     private Tensor<float> centersToCorners;
 
@@ -51,14 +67,28 @@ public class RunYOLO : MonoBehaviour
 
     void Start()
     {
-        // 최신 기기 성능 대응 및 화면 고정
         Application.targetFrameRate = 60;
+
+        // 휴대폰 가로 화면 고정
+        Screen.autorotateToPortrait = false;
+        Screen.autorotateToPortraitUpsideDown = false;
+        Screen.autorotateToLandscapeLeft = true;
+        Screen.autorotateToLandscapeRight = true;
         Screen.orientation = ScreenOrientation.LandscapeLeft;
 
-        if (classesAsset != null)
-            labels = classesAsset.text.Split('\n');
+        if (displayImage == null)
+        {
+            Debug.LogError("Display Image가 연결되지 않았습니다.");
+            return;
+        }
 
-        // 1. 안드로이드 카메라 권한 확인 및 요청
+        SetupLeftCameraArea();
+
+        if (classesAsset != null)
+        {
+            labels = classesAsset.text.Split('\n');
+        }
+
         if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
         {
             Permission.RequestUserPermission(Permission.Camera);
@@ -66,58 +96,110 @@ public class RunYOLO : MonoBehaviour
 
         LoadModel();
 
-        targetRT = new RenderTexture(imageWidth, imageHeight, 0);
-        yoloRT = new RenderTexture(imageWidth, imageHeight, 0);
-        displayLocation = displayImage.transform;
+        // 화면 표시용은 와이드
+        displayRT = new RenderTexture(displayWidthRT, displayHeightRT, 0);
+        displayRT.Create();
 
-        // 2. 카메라 시작 (코루틴 방식으로 권한 획득 대기)
-        StartCoroutine(SetupInputCoroutine());
+        // YOLO 분석용은 640x640
+        yoloRT = new RenderTexture(imageWidth, imageHeight, 0);
+        yoloRT.Create();
+
+        displayImage.texture = displayRT;
+        displayLocation = displayImage.transform;
 
         if (borderTexture != null)
         {
-            borderSprite = Sprite.Create(borderTexture, new Rect(0, 0, borderTexture.width, borderTexture.height), new Vector2(borderTexture.width / 2, borderTexture.height / 2));
+            borderSprite = Sprite.Create(
+                borderTexture,
+                new Rect(0, 0, borderTexture.width, borderTexture.height),
+                new Vector2(0.5f, 0.5f)
+            );
         }
+
+        StartCoroutine(SetupInputCoroutine());
+    }
+
+    void SetupLeftCameraArea()
+    {
+        RectTransform rt = displayImage.rectTransform;
+
+        // 왼쪽 영역만 YOLO 카메라 화면으로 사용
+        // X 0 ~ 0.6 = 왼쪽 60%
+        // X 0.6 ~ 1 = 오른쪽 답변 UI 영역
+        rt.anchorMin = new Vector2(0f, 0f);
+        rt.anchorMax = new Vector2(cameraAreaRatio, 1f);
+
+        rt.offsetMin = Vector2.zero;
+        rt.offsetMax = Vector2.zero;
+
+        rt.pivot = new Vector2(0.5f, 0.5f);
+        rt.localScale = Vector3.one;
+        rt.localRotation = Quaternion.identity;
+        rt.localEulerAngles = Vector3.zero;
+
+        displayImage.color = Color.white;
+        displayImage.raycastTarget = false;
+
+        // 카메라 화면을 가장 뒤로 보냄
+        displayImage.transform.SetAsFirstSibling();
     }
 
     void LoadModel()
     {
+        if (modelAsset == null)
+        {
+            Debug.LogError("YOLO modelAsset이 연결되지 않았습니다.");
+            return;
+        }
+
         var model1 = ModelLoader.Load(modelAsset);
 
-        centersToCorners = new Tensor<float>(new TensorShape(4, 4),
-        new float[]
-        {
-            1,      0,      1,      0,
-            0,      1,      0,      1,
-            -0.5f,  0,      0.5f,   0,
-            0,      -0.5f,  0,      0.5f
-        });
+        centersToCorners = new Tensor<float>(
+            new TensorShape(4, 4),
+            new float[]
+            {
+                1,      0,      1,      0,
+                0,      1,      0,      1,
+                -0.5f,  0,      0.5f,   0,
+                0,      -0.5f,  0,      0.5f
+            }
+        );
 
         var graph = new FunctionalGraph();
         var inputs = graph.AddInputs(model1);
         var modelOutput = Functional.Forward(model1, inputs)[0];
+
         var boxCoords = modelOutput[0, 0..4, ..].Transpose(0, 1);
         var allScores = modelOutput[0, 4.., ..];
+
         var scores = Functional.ReduceMax(allScores, 0);
         var classIDs = Functional.ArgMax(allScores, 0);
+
         var boxCorners = Functional.MatMul(boxCoords, Functional.Constant(centersToCorners));
         var indices = Functional.NMS(boxCorners, scores, iouThreshold, scoreThreshold);
+
         var coords = Functional.IndexSelect(boxCoords, 0, indices);
         var labelIDs = Functional.IndexSelect(classIDs, 0, indices);
 
         worker = new Worker(graph.Compile(coords, labelIDs), backend);
     }
 
-    // 카메라 권한 승인 시까지 기다렸다가 실행
     IEnumerator SetupInputCoroutine()
     {
         yield return new WaitUntil(() => Permission.HasUserAuthorizedPermission(Permission.Camera));
 
         WebCamDevice[] devices = WebCamTexture.devices;
+
         if (devices.Length > 0)
         {
-            webCamTexture = new WebCamTexture(devices[0].name, 1280, 720);
+            webCamTexture = new WebCamTexture(devices[0].name, 1280, 720, 30);
             webCamTexture.Play();
+
             Debug.Log("카메라가 시작되었습니다: " + devices[0].name);
+
+            yield return new WaitUntil(() => webCamTexture.width > 100);
+
+            Debug.Log("카메라 해상도: " + webCamTexture.width + " x " + webCamTexture.height);
         }
         else
         {
@@ -127,23 +209,33 @@ public class RunYOLO : MonoBehaviour
 
     private void Update()
     {
-        // 3. 카메라 데이터가 실제로 들어왔는지 확인 (검은 화면 방지 핵심)
-        if (webCamTexture != null && webCamTexture.didUpdateThisFrame && webCamTexture.width > 100)
+        if (webCamTexture != null &&
+            webCamTexture.isPlaying &&
+            webCamTexture.didUpdateThisFrame &&
+            webCamTexture.width > 100)
         {
-            // 모바일 카메라 텍스처 회전/반전 보정
-            float rotation = -webCamTexture.videoRotationAngle;
-            displayImage.rectTransform.localEulerAngles = new Vector3(0, 0, rotation);
+            // RawImage 자체 회전 금지
+            // 회전시키면 왼쪽 영역 배치와 박스 좌표가 틀어질 수 있음
+            displayImage.rectTransform.localRotation = Quaternion.identity;
+            displayImage.rectTransform.localEulerAngles = Vector3.zero;
 
-            // 상하 반전 대응 (안드로이드에서 자주 발생)
+            // 상하 반전만 처리
             if (webCamTexture.videoVerticallyMirrored)
+            {
                 displayImage.uvRect = new Rect(0, 1, 1, -1);
+            }
             else
+            {
                 displayImage.uvRect = new Rect(0, 0, 1, 1);
+            }
 
-            Graphics.Blit(webCamTexture, targetRT);
-            displayImage.texture = targetRT;
+            // 화면 표시용: 왼쪽 카메라 영역에 와이드 화면 표시
+            Graphics.Blit(webCamTexture, displayRT);
+            displayImage.texture = displayRT;
 
-            // 4. 추론 실행
+            // YOLO 분석용: 640x640으로 분석
+            Graphics.Blit(webCamTexture, yoloRT);
+
             _ = ExecuteML();
         }
 
@@ -155,64 +247,112 @@ public class RunYOLO : MonoBehaviour
 
     public async Task ExecuteML()
     {
-        // 프레임 스킵 (최신 기기이므로 5~8 프레임 적절)
         frameCount++;
-        if (frameCount % 5 != 0) return;
 
-        if (isProcessing) return;
+        // 5프레임마다 한 번만 추론
+        if (frameCount % 5 != 0)
+            return;
+
+        if (isProcessing)
+            return;
+
         isProcessing = true;
 
-        if (webCamTexture == null || !webCamTexture.isPlaying || webCamTexture.width < 100)
+        Tensor<float> output = null;
+        Tensor<int> labelIDs = null;
+
+        try
         {
-            isProcessing = false;
-            return;
-        }
-
-        using Tensor<float> inputTensor = new Tensor<float>(new TensorShape(1, 3, imageHeight, imageWidth));
-
-        Graphics.Blit(targetRT, yoloRT);
-        TextureConverter.ToTensor(yoloRT, inputTensor, default);
-
-        worker.Schedule(inputTensor);
-
-        var outputTensor = worker.PeekOutput("output_0") as Tensor<float>;
-        var labelIDsTensor = worker.PeekOutput("output_1") as Tensor<int>;
-
-        // 비동기 데이터 읽기
-        var output = await outputTensor.ReadbackAndCloneAsync();
-        var labelIDs = await labelIDsTensor.ReadbackAndCloneAsync();
-
-        float displayWidth = displayImage.rectTransform.rect.width;
-        float displayHeight = displayImage.rectTransform.rect.height;
-
-        float scaleX = displayWidth / imageWidth;
-        float scaleY = displayHeight / imageHeight;
-
-        int boxesFound = output.shape[0];
-
-        ClearAnnotations();
-
-        for (int n = 0; n < Mathf.Min(boxesFound, 50); n++) // 최대 검출 개수 제한
-        {
-            var box = new BoundingBox
+            if (webCamTexture == null ||
+                !webCamTexture.isPlaying ||
+                webCamTexture.width < 100 ||
+                worker == null ||
+                yoloRT == null)
             {
-                centerX = output[n, 0] * scaleX - displayWidth / 2,
-                centerY = output[n, 1] * scaleY - displayHeight / 2,
-                width = output[n, 2] * scaleX,
-                height = output[n, 3] * scaleY,
-                label = (labels != null && labelIDs[n] < labels.Length) ? labels[labelIDs[n]] : "Object",
-            };
-            DrawBox(box, n, displayHeight * 0.05f);
-        }
+                return;
+            }
 
-        output.Dispose();
-        labelIDs.Dispose();
-        isProcessing = false;
+            using Tensor<float> inputTensor = new Tensor<float>(
+                new TensorShape(1, 3, imageHeight, imageWidth)
+            );
+
+            TextureConverter.ToTensor(yoloRT, inputTensor, default);
+
+            worker.Schedule(inputTensor);
+
+            var outputTensor = worker.PeekOutput("output_0") as Tensor<float>;
+            var labelIDsTensor = worker.PeekOutput("output_1") as Tensor<int>;
+
+            if (outputTensor == null || labelIDsTensor == null)
+            {
+                Debug.LogWarning("YOLO 출력 텐서를 읽지 못했습니다.");
+                return;
+            }
+
+            output = await outputTensor.ReadbackAndCloneAsync();
+            labelIDs = await labelIDsTensor.ReadbackAndCloneAsync();
+
+            float displayWidth = displayImage.rectTransform.rect.width;
+            float displayHeight = displayImage.rectTransform.rect.height;
+
+            if (displayWidth <= 0 || displayHeight <= 0)
+            {
+                Debug.LogWarning("Display Image 크기가 0입니다.");
+                return;
+            }
+
+            float scaleX = displayWidth / imageWidth;
+            float scaleY = displayHeight / imageHeight;
+
+            int boxesFound = output.shape[0];
+
+            ClearAnnotations();
+            lastDetectedLabel = "";
+
+            for (int n = 0; n < Mathf.Min(boxesFound, 50); n++)
+            {
+                string detectedLabel = "Object";
+
+                int labelIndex = labelIDs[n];
+
+                if (labels != null && labelIndex >= 0 && labelIndex < labels.Length)
+                {
+                    detectedLabel = labels[labelIndex].Trim();
+                }
+
+                BoundingBox box = new BoundingBox
+                {
+                    centerX = output[n, 0] * scaleX - displayWidth / 2f,
+                    centerY = output[n, 1] * scaleY - displayHeight / 2f,
+                    width = output[n, 2] * scaleX,
+                    height = output[n, 3] * scaleY,
+                    label = detectedLabel
+                };
+
+                if (n == 0)
+                {
+                    lastDetectedLabel = box.label;
+                }
+
+                DrawBox(box, n, Mathf.Max(20f, displayHeight * 0.04f));
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("YOLO 실행 중 오류: " + e.Message);
+        }
+        finally
+        {
+            output?.Dispose();
+            labelIDs?.Dispose();
+            isProcessing = false;
+        }
     }
 
     public void DrawBox(BoundingBox box, int id, float fontSize)
     {
         GameObject panel;
+
         if (id < boxPool.Count)
         {
             panel = boxPool[id];
@@ -223,53 +363,77 @@ public class RunYOLO : MonoBehaviour
             panel = CreateNewBox(Color.yellow);
         }
 
-        panel.transform.localPosition = new Vector3(box.centerX, -box.centerY);
         RectTransform rt = panel.GetComponent<RectTransform>();
+
+        rt.anchorMin = new Vector2(0.5f, 0.5f);
+        rt.anchorMax = new Vector2(0.5f, 0.5f);
+        rt.pivot = new Vector2(0.5f, 0.5f);
+
+        rt.anchoredPosition = new Vector2(box.centerX, -box.centerY);
         rt.sizeDelta = new Vector2(box.width, box.height);
 
-        var label = panel.GetComponentInChildren<Text>();
+        Text label = panel.GetComponentInChildren<Text>();
+
         if (label != null)
         {
             label.text = box.label;
-            label.fontSize = (int)fontSize;
+            label.fontSize = Mathf.RoundToInt(fontSize);
         }
     }
 
     public GameObject CreateNewBox(Color color)
     {
-        var panel = new GameObject("ObjectBox");
+        GameObject panel = new GameObject("ObjectBox");
         panel.AddComponent<CanvasRenderer>();
+
         Image img = panel.AddComponent<Image>();
-        img.color = color;
-        img.sprite = borderSprite;
-        img.type = Image.Type.Sliced;
+        img.color = new Color(color.r, color.g, color.b, 0.35f);
+
+        if (borderSprite != null)
+        {
+            img.sprite = borderSprite;
+            img.type = Image.Type.Sliced;
+        }
+
         panel.transform.SetParent(displayLocation, false);
 
-        var textObj = new GameObject("ObjectLabel");
+        RectTransform panelRect = panel.GetComponent<RectTransform>();
+        panelRect.anchorMin = new Vector2(0.5f, 0.5f);
+        panelRect.anchorMax = new Vector2(0.5f, 0.5f);
+        panelRect.pivot = new Vector2(0.5f, 0.5f);
+        panelRect.anchoredPosition = Vector2.zero;
+
+        GameObject textObj = new GameObject("ObjectLabel");
         textObj.AddComponent<CanvasRenderer>();
         textObj.transform.SetParent(panel.transform, false);
+
         Text txt = textObj.AddComponent<Text>();
         txt.font = font;
         txt.color = color;
-        txt.fontSize = 40;
+        txt.fontSize = 30;
         txt.horizontalOverflow = HorizontalWrapMode.Overflow;
+        txt.verticalOverflow = VerticalWrapMode.Overflow;
 
-        RectTransform rt2 = textObj.GetComponent<RectTransform>();
-        rt2.anchorMin = new Vector2(0, 1); // 상단 좌측 기준
-        rt2.anchorMax = new Vector2(0, 1);
-        rt2.pivot = new Vector2(0, 0);
-        rt2.offsetMin = new Vector2(5, 5);
-        rt2.sizeDelta = new Vector2(200, 50);
+        RectTransform textRect = textObj.GetComponent<RectTransform>();
+        textRect.anchorMin = new Vector2(0, 1);
+        textRect.anchorMax = new Vector2(0, 1);
+        textRect.pivot = new Vector2(0, 1);
+        textRect.anchoredPosition = new Vector2(5, -5);
+        textRect.sizeDelta = new Vector2(300, 60);
 
         boxPool.Add(panel);
+
         return panel;
     }
 
     public void ClearAnnotations()
     {
-        foreach (var box in boxPool)
+        foreach (GameObject box in boxPool)
         {
-            if (box != null) box.SetActive(false);
+            if (box != null)
+            {
+                box.SetActive(false);
+            }
         }
     }
 
@@ -277,8 +441,22 @@ public class RunYOLO : MonoBehaviour
     {
         centersToCorners?.Dispose();
         worker?.Dispose();
-        if (targetRT != null) targetRT.Release();
-        if (yoloRT != null) yoloRT.Release();
-        if (webCamTexture != null) webCamTexture.Stop();
+
+        if (displayRT != null)
+        {
+            displayRT.Release();
+            Destroy(displayRT);
+        }
+
+        if (yoloRT != null)
+        {
+            yoloRT.Release();
+            Destroy(yoloRT);
+        }
+
+        if (webCamTexture != null)
+        {
+            webCamTexture.Stop();
+        }
     }
 }
