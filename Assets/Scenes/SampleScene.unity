@@ -2024,7 +2024,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 249565c125ede084a953a2de98b3e0ef, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::GeminiManager
-  apiKey: AIzaSyDF8hPq_V_g4KxGXHMAiPm6EH4CPZT9afk
+  apiKey: AIzaSyCLPXld0h40sZOz1FJ6MP9hHhhKhmugRj8
   responseText: {fileID: 2052234492}
   countText: {fileID: 0}
   askButton: {fileID: 1071665587}
